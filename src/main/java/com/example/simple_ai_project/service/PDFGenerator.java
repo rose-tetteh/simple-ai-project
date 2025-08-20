@@ -2,19 +2,16 @@ package com.example.simple_ai_project.service;
 
 import com.itextpdf.text.Document;
 import com.itextpdf.text.Paragraph;
+import com.itextpdf.text.pdf.PdfException;
 import com.itextpdf.text.pdf.PdfWriter;
 import org.springframework.stereotype.Component;
 
 import java.io.ByteArrayOutputStream;
-import java.io.FileOutputStream;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 
 @Component
 public class PDFGenerator {
 
-    public byte[] generatePdf(String summary, String feedback, Double score) {
+    public byte[] generatePdf(String summary, String feedback, Double score) throws PdfException {
         try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
             Document document = new Document();
             PdfWriter.getInstance(document, baos);
@@ -33,7 +30,7 @@ public class PDFGenerator {
             document.close();
             return baos.toByteArray();
         } catch (Exception e) {
-            throw new RuntimeException("Failed to generate PDF", e);
+            throw new PdfException(e);
         }
     }
 }

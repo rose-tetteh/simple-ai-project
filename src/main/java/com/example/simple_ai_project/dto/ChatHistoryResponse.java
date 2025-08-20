@@ -12,8 +12,9 @@ import java.time.LocalDateTime;
 @NoArgsConstructor
 @AllArgsConstructor
 public class ChatHistoryResponse {
+    private Long id;
     private String fileName;
     private Double englishProficiencyScore;
-    private String pdfLink; // This will hold the pre-signed URL
+    private String pdfLink;
     private LocalDateTime createdAt;
 }

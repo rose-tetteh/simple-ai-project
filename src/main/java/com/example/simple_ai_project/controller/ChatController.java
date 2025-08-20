@@ -2,7 +2,6 @@ package com.example.simple_ai_project.controller;
 
 import com.example.simple_ai_project.dto.ChatHistoryResponse;
 import com.example.simple_ai_project.dto.ResponseHandler;
-import com.example.simple_ai_project.model.ChatHistory;
 import com.example.simple_ai_project.service.AiService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -36,6 +35,18 @@ public class ChatController {
         try {
             List<ChatHistoryResponse> chats = aiService.getUserChats();
             return ResponseHandler.success(chats, "User chats retrieved successfully", HttpStatus.OK);
+        } catch (Exception e) {
+            return ResponseHandler.error(null, e.getMessage(), HttpStatus.BAD_REQUEST);
+        }
+    }
+
+    @DeleteMapping("/history/{chatId}")
+    public ResponseEntity<Object> deleteChatHistory(@PathVariable Long chatId) {
+        try {
+            String result = aiService.deleteChatHistory(chatId);
+            return ResponseHandler.success(null, result, HttpStatus.OK);
+        } catch (SecurityException e) {
+            return ResponseHandler.error(null, e.getMessage(), HttpStatus.FORBIDDEN);
         } catch (Exception e) {
             return ResponseHandler.error(null, e.getMessage(), HttpStatus.BAD_REQUEST);
         }

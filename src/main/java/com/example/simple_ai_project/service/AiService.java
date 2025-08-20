@@ -16,7 +16,6 @@ import java.io.IOException;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Objects;
-import java.util.stream.Collectors;
 
 @Service
 public class AiService {
@@ -26,6 +25,7 @@ public class AiService {
     private final UserRepository userRepository;
     private final ChatHistoryRepository chatHistoryRepository;
     private final S3Service s3Service;
+    private static final String USER_NOT_FOUND = "User not found";
 
     public AiService(OpenAiChatModel openAiChatModel, PDFGenerator pdfGenerator, UserRepository userRepository, ChatHistoryRepository chatHistoryRepository, S3Service s3Service) {
         this.openAiChatModel = openAiChatModel;
@@ -38,12 +38,10 @@ public class AiService {
     public FileProcessingResponse processFile(MultipartFile file) {
         String username = SecurityContextHolder.getContext().getAuthentication().getName();
         User user = userRepository.findByUserName(username)
-                .orElseThrow(() -> new RuntimeException("User not found"));
+                .orElseThrow(() -> new RuntimeException(USER_NOT_FOUND));
 
-        // Upload original file to S3
-        String fileKey = s3Service.uploadFile(file);
+        s3Service.uploadFile(file);
 
-        // Analyze file content
         String analysis;
         try {
             analysis = analyzeFileContent(file.getBytes());
@@ -55,20 +53,17 @@ public class AiService {
         String feedback = extractFeedback(analysis);
         Double score = extractScore(analysis);
 
-        // Generate PDF and upload to S3
         byte[] pdfBytes = pdfGenerator.generatePdf(summary, feedback, score);
         String pdfKey = s3Service.uploadPdf(pdfBytes, Objects.requireNonNull(file.getOriginalFilename()));
 
-        // Save chat history with S3 key for the PDF
         ChatHistory chatHistory = new ChatHistory();
         chatHistory.setUser(user);
         chatHistory.setFileName(file.getOriginalFilename());
         chatHistory.setEnglishProficiencyScore(score);
-        chatHistory.setPdfLink(pdfKey); // Save the S3 key
+        chatHistory.setPdfLink(pdfKey);
         chatHistory.setCreatedAt(LocalDateTime.now());
         chatHistoryRepository.save(chatHistory);
 
-        // Generate pre-signed URL for the response
         String presignedUrl = s3Service.generatePresignedUrl(pdfKey);
         return new FileProcessingResponse(presignedUrl, score);
     }
@@ -76,135 +71,204 @@ public class AiService {
     public List<ChatHistoryResponse> getUserChats() {
         String username = SecurityContextHolder.getContext().getAuthentication().getName();
         User user = userRepository.findByUserName(username)
-                .orElseThrow(() -> new RuntimeException("User not found"));
+                .orElseThrow(() -> new RuntimeException(USER_NOT_FOUND));
 
         List<ChatHistory> histories = chatHistoryRepository.findByUser(user);
 
         return histories.stream().map(history -> new ChatHistoryResponse(
+                history.getId(),
                 history.getFileName(),
                 history.getEnglishProficiencyScore(),
-                s3Service.generatePresignedUrl(history.getPdfLink()), // Generate pre-signed URL
+                s3Service.generatePresignedUrl(history.getPdfLink()),
                 history.getCreatedAt()
-        )).collect(Collectors.toList());
+        )).toList();
     }
 
-    public String analyzeFileContent(byte[] fileContent) throws IOException {
+    public String deleteChatHistory(Long chatId) {
+        String username = SecurityContextHolder.getContext().getAuthentication().getName();
+        User user = userRepository.findByUserName(username)
+                .orElseThrow(() -> new EntityNotFoundException(USER_NOT_FOUND));
+
+        ChatHistory chatHistory = chatHistoryRepository.findById(chatId)
+                .orElseThrow(() -> new EntityNotFoundException("Chat history not found"));
+
+        if (!chatHistory.getUser().getId().equals(user.getId())) {
+            throw new SecurityException("You are not authorized to delete this chat history");
+        }
+
+        try {
+            s3Service.deleteFile(chatHistory.getPdfLink());
+        } catch (Exception e) {
+            throw new EntityNotFoundException("Failed to delete PDF from S3: " + e.getMessage());
+        }
+
+        chatHistoryRepository.delete(chatHistory);
+
+        return "Chat history deleted successfully";
+    }
+
+    public String analyzeFileContent(byte[] fileContent) {
         String content = new String(fileContent);
         String prompt = "Analyze the following text and provide your response in this exact format:\n\n" +
                 "Summary: [Your detailed summary here]\n\n" +
                 "Feedback: [Your detailed feedback on English proficiency, grammar, vocabulary, etc.];[Your full modified version based on the feedback]\n\n" +
-                "Score: [A number between 0-100]%\n\n" +
+                "English Proficiency Score: [A number between 0-100]%\n\n" +
                 "Text to analyze:\n" + content;
         return openAiChatModel.call(prompt);
     }
 
-    // extractSummary, extractFeedback, and extractScore methods remain the same
     private String extractSummary(String analysis) {
         String[] summaryKeywords = {"Summary:", "SUMMARY:", "summary:", "1. Summary", "**Summary**"};
         String[] feedbackKeywords = {"Feedback:", "FEEDBACK:", "feedback:", "2. Feedback", "**Feedback**"};
-        for (String summaryKeyword : summaryKeywords) {
-            int summaryStart = analysis.indexOf(summaryKeyword);
-            if (summaryStart != -1) {
-                int contentStart = summaryStart + summaryKeyword.length();
-                int feedbackStart = -1;
-                for (String feedbackKeyword : feedbackKeywords) {
-                    feedbackStart = analysis.indexOf(feedbackKeyword, contentStart);
-                    if (feedbackStart != -1) break;
-                }
-                if (feedbackStart != -1) {
-                    return analysis.substring(contentStart, feedbackStart).trim();
+
+        String summaryContent = findContentBetweenKeywords(analysis, summaryKeywords, feedbackKeywords);
+        if (summaryContent != null) {
+            return summaryContent;
+        }
+
+        return getFirstLineOrDefault(analysis);
+    }
+
+    private String findContentBetweenKeywords(String analysis, String[] startKeywords, String[] endKeywords) {
+        for (String startKeyword : startKeywords) {
+            int startIndex = analysis.indexOf(startKeyword);
+            if (startIndex != -1) {
+                int contentStart = startIndex + startKeyword.length();
+                int endIndex = findNextKeywordIndex(analysis, endKeywords, contentStart);
+
+                if (endIndex != -1) {
+                    return analysis.substring(contentStart, endIndex).trim();
                 } else {
-                    String remaining = analysis.substring(contentStart);
-                    int doubleNewline = remaining.indexOf("\n\n");
-                    if (doubleNewline != -1) {
-                        return remaining.substring(0, doubleNewline).trim();
-                    } else {
-                        return remaining.length() > 200 ? remaining.substring(0, 200).trim() + "..." : remaining.trim();
-                    }
+                    return extractRemainingContent(analysis, contentStart);
                 }
             }
         }
-        String[] lines = analysis.split("\n");
-        if (lines.length > 0) {
-            return lines[0].trim();
+        return null;
+    }
+
+    private int findNextKeywordIndex(String analysis, String[] keywords, int startFrom) {
+        for (String keyword : keywords) {
+            int index = analysis.indexOf(keyword, startFrom);
+            if (index != -1) {
+                return index;
+            }
         }
-        return "Summary not found";
+        return -1;
+    }
+
+    private String extractRemainingContent(String analysis, int startIndex) {
+        String remaining = analysis.substring(startIndex);
+        int doubleNewline = remaining.indexOf("\n\n");
+
+        if (doubleNewline != -1) {
+            return remaining.substring(0, doubleNewline).trim();
+        }
+
+        return remaining.length() > 200 ? remaining.substring(0, 200).trim() + "..." : remaining.trim();
+    }
+
+    private String getFirstLineOrDefault(String analysis) {
+        String[] lines = analysis.split("\n");
+        return lines.length > 0 ? lines[0].trim() : "Summary not found";
     }
 
     private String extractFeedback(String analysis) {
         String[] feedbackKeywords = {"Feedback:", "FEEDBACK:", "feedback:", "2. Feedback", "**Feedback**"};
         String[] scoreKeywords = {"Score:", "SCORE:", "score:", "3. Score", "**Score**", "Percentage:", "Rating:"};
-        for (String feedbackKeyword : feedbackKeywords) {
-            int feedbackStart = analysis.indexOf(feedbackKeyword);
-            if (feedbackStart != -1) {
-                int contentStart = feedbackStart + feedbackKeyword.length();
-                int scoreStart = -1;
-                for (String scoreKeyword : scoreKeywords) {
-                    scoreStart = analysis.indexOf(scoreKeyword, contentStart);
-                    if (scoreStart != -1) break;
-                }
-                if (scoreStart != -1) {
-                    return analysis.substring(contentStart, scoreStart).trim();
-                } else {
-                    return analysis.substring(contentStart).trim();
-                }
-            }
+
+        String feedbackContent = findContentBetweenKeywords(analysis, feedbackKeywords, scoreKeywords);
+        if (feedbackContent != null) {
+            return feedbackContent;
         }
+
+        return extractFeedbackFromLines(analysis);
+    }
+
+    private String extractFeedbackFromLines(String analysis) {
         String[] lines = analysis.split("\n");
-        if (lines.length > 2) {
-            StringBuilder feedback = new StringBuilder();
-            boolean inFeedbackSection = false;
-            for (String line : lines) {
-                if (line.toLowerCase().contains("feedback") || line.toLowerCase().contains("grammar") ||
-                        line.toLowerCase().contains("proficiency") || inFeedbackSection) {
-                    inFeedbackSection = true;
-                    if (!line.toLowerCase().contains("score") && !line.toLowerCase().contains("%")) {
-                        feedback.append(line).append("\n");
-                    } else {
-                        break;
-                    }
+        if (lines.length <= 2) {
+            return "Feedback not found";
+        }
+
+        StringBuilder feedback = new StringBuilder();
+        boolean inFeedbackSection = false;
+
+        for (String line : lines) {
+            if (shouldStartFeedbackSection(line, inFeedbackSection)) {
+                inFeedbackSection = true;
+                if (shouldIncludeLine(line)) {
+                    feedback.append(line).append("\n");
+                } else {
+                    break;
                 }
             }
-            if (!feedback.isEmpty()) {
-                return feedback.toString().trim();
-            }
         }
-        return "Feedback not found";
+
+        return feedback.isEmpty() ? "Feedback not found" : feedback.toString().trim();
+    }
+
+    private boolean shouldStartFeedbackSection(String line, boolean alreadyInSection) {
+        String lowerLine = line.toLowerCase();
+        return alreadyInSection || lowerLine.contains("feedback") ||
+               lowerLine.contains("grammar") || lowerLine.contains("proficiency");
+    }
+
+    private boolean shouldIncludeLine(String line) {
+        String lowerLine = line.toLowerCase();
+        return !lowerLine.contains("score") && !lowerLine.contains("%");
     }
 
     private Double extractScore(String analysis) {
         String[] scoreKeywords = {"Score:", "SCORE:", "score:", "3. Score", "**Score**", "Percentage:", "Rating:"};
+
+        Double scoreFromKeywords = extractScoreFromKeywords(analysis, scoreKeywords);
+        if (scoreFromKeywords != null) {
+            return scoreFromKeywords;
+        }
+
+        Double scoreFromPercentage = extractScoreFromPercentageWords(analysis);
+        return Objects.requireNonNullElse(scoreFromPercentage, 75.0);
+
+    }
+
+    private Double extractScoreFromKeywords(String analysis, String[] scoreKeywords) {
         for (String scoreKeyword : scoreKeywords) {
             int scoreStart = analysis.indexOf(scoreKeyword);
             if (scoreStart != -1) {
                 String scoreSection = analysis.substring(scoreStart + scoreKeyword.length()).trim();
-                String[] lines = scoreSection.split("\n");
-                String scoreLine = lines[0].trim();
-                String numberStr = scoreLine.replaceAll("[^0-9.]", "");
-                if (!numberStr.isEmpty()) {
-                    try {
-                        double score = Double.parseDouble(numberStr);
-                        return Math.min(score, 100.0);
-                    } catch (NumberFormatException e) {
-                        // Continue
-                    }
+                String scoreLine = scoreSection.split("\n")[0].trim();
+                Double score = parseScoreFromText(scoreLine);
+                if (score != null) {
+                    return score;
                 }
             }
         }
+        return null;
+    }
+
+    private Double extractScoreFromPercentageWords(String analysis) {
         String[] words = analysis.split("\\s+");
         for (String word : words) {
             if (word.contains("%")) {
-                String numberStr = word.replaceAll("[^0-9.]", "");
-                if (!numberStr.isEmpty()) {
-                    try {
-                        double score = Double.parseDouble(numberStr);
-                        return Math.min(score, 100.0);
-                    } catch (NumberFormatException e) {
-                        // Continue
-                    }
+                Double score = parseScoreFromText(word);
+                if (score != null) {
+                    return score;
                 }
             }
         }
-        return 75.0;
+        return null;
+    }
+
+    private Double parseScoreFromText(String text) {
+        String numberStr = text.replaceAll("[^0-9.]", "");
+        if (!numberStr.isEmpty()) {
+            try {
+                double score = Double.parseDouble(numberStr);
+                return Math.min(score, 100.0);
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+        return null;
     }
 }
