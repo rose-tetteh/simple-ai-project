@@ -7,6 +7,7 @@ import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.SignatureAlgorithm;
 import io.jsonwebtoken.io.Decoders;
 import io.jsonwebtoken.security.Keys;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -18,6 +19,7 @@ import java.util.Map;
 import java.util.function.Function;
 
 @Component
+@Slf4j
 public class JwtUtils {
 
 	@Value("${prox.app.jwtSecret}")
@@ -43,8 +45,11 @@ public class JwtUtils {
 	public boolean validateToken(String token) {
 		try {
 			Claims claims = getClaims(token);
-			return !claims.getExpiration().before(new Date());
+			boolean isValid = !claims.getExpiration().before(new Date());
+			log.debug("Token validation result: {}, expires: {}", isValid, claims.getExpiration());
+			return isValid;
 		} catch (Exception e) {
+			log.error("Token validation failed: {}", e.getMessage());
 			return false;
 		}
 	}
