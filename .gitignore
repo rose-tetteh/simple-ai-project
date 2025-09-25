@@ -21,7 +21,6 @@ target/
 .env
 .gitattributes
 mvnw
-m
 
 ### NetBeans ###
 /nbproject/private/
